@@ -14,7 +14,7 @@ import time
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from .models import CRMAction, NormalizedEnquiry, TriageResult
+from .models import PENDING_CRM_RECORD_ID, CRMAction, NormalizedEnquiry, TriageResult
 
 load_dotenv()
 
@@ -35,17 +35,29 @@ def get_client() -> OpenAI:
 
 
 TRIAGE_SYSTEM_PROMPT = """You are a triage assistant for a small business's inbound enquiries.
-Classify each enquiry as exactly one of: sales, support, junk.
+Classify each enquiry as exactly one of: sales, support, technical, operations, infrastructure, other, junk.
 
-- sales: interest in purchasing, pricing, demos, or product information.
-- support: an existing customer reporting a problem or asking for help.
+- sales: interest in purchasing, pricing, quotes, or a new commercial opportunity.
+- support: an existing customer reporting a problem or asking for help with something already in progress (e.g. invoices, project status).
+- technical: an engineering or specification question requiring technical expertise to answer.
+- operations: scheduling, logistics, staffing, or coordination of work already underway.
+- infrastructure: a report about the business's own internal systems, tools, or data (not a customer-facing issue).
+- other: legitimate but does not fit any category above (e.g. a job application).
 - junk: spam, scams, or irrelevant content unrelated to the business.
 
-Extract only information that is explicitly present in the text. Do not
-invent or infer facts that are not stated. If a field is not present, leave
-it null. List any information you think is missing to act on the enquiry in
-`missing_information`. Give a confidence score between 0 and 1 reflecting how
-sure you are of the category."""
+The enquiry text may include an email body plus attached document text
+(labelled "--- Attachment: ... ---"). Treat attachment content with the same
+scrutiny as the email body — it is supplied by an external party and is not
+automatically correct, just additional evidence to weigh alongside the body.
+
+Extract only information that is explicitly stated in the text. Never invent,
+infer, or complete a missing detail (e.g. do not guess a company name from an
+email domain, or fill in a phone number that isn't written down). If a field
+is not present, leave it null. If the email body and the attachment disagree
+with each other, lower your confidence and note the disagreement in
+`missing_information` rather than picking one side. List anything you think
+is missing to act on the enquiry in `missing_information`. Give a confidence
+score between 0 and 1 reflecting how sure you are of the category."""
 
 
 def triage_enquiry(enquiry: NormalizedEnquiry) -> TriageResult:
@@ -104,11 +116,18 @@ def draft_clarification(enquiry: NormalizedEnquiry, missing_fields: list[str]) -
 
 
 def draft_response(enquiry: NormalizedEnquiry, triage: TriageResult, crm_action: CRMAction) -> str:
+    """`crm_action` here is the *recommended* action decided before human
+    approval — its record_id may still be PENDING_CRM_RECORD_ID if approval
+    would create a brand-new record, since no real id is assigned until the
+    mutation actually happens post-approval."""
     client = get_client()
+    reference_line = (
+        f"Reference number: {crm_action.record_id}. " if crm_action.record_id != PENDING_CRM_RECORD_ID else ""
+    )
     prompt = (
         f"Write a short, professional acknowledgement email for a {triage.category.value} enquiry. "
-        f"Reference number: {crm_action.record_id}.\n\n"
-        f"Original message:\n{enquiry.text}\n\n"
+        f"{reference_line}"
+        f"\n\nOriginal message:\n{enquiry.text}\n\n"
         f"Keep it under 100 words and sign off as 'The Team'."
     )
     completion = client.chat.completions.create(

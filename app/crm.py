@@ -47,6 +47,13 @@ class MockCRM:
                 "category": triage.category.value,
                 "status": "open",
                 "enquiry_ids": [enquiry.enquiry_id],
+                # Extra fields (unused by Test 1) so this record can also
+                # serve as a match candidate for later enquiries — see
+                # app/crm_match.py.
+                "company": triage.company_name or "",
+                "contact": enquiry.sender_name or triage.contact_name or "",
+                "phone": triage.phone or "",
+                "location": triage.location or "",
             }
         )
         return CRMAction(
@@ -55,6 +62,25 @@ class MockCRM:
             is_duplicate=False,
             details={"category": triage.category.value},
         )
+
+    def all_records(self) -> list[dict]:
+        """Every record created so far, across all senders — used to match
+        later enquiries against enquiries already processed in this run."""
+        return [record for records in self._records.values() for record in records]
+
+    def attach(self, record_id: str, enquiry_id: str) -> bool:
+        """Links an enquiry to a record this MockCRM created earlier in the
+        run. No-ops (returns False) for a record_id this instance doesn't
+        own — e.g. a static external crm.csv row, which has no local
+        mutable copy to update. Callers should only invoke this after
+        approval; it is the only other mutating method besides process()."""
+        for records in self._records.values():
+            for record in records:
+                if record["record_id"] == record_id:
+                    if enquiry_id not in record["enquiry_ids"]:
+                        record["enquiry_ids"].append(enquiry_id)
+                    return True
+        return False
 
 
 # Module-level singleton so a demo run can accumulate CRM state across
