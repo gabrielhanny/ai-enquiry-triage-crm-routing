@@ -9,6 +9,8 @@ Usage:
     python run_dataset.py                 # table of all enquiries
     python run_dataset.py --id E005       # full detail for one enquiry
     python run_dataset.py --json          # structured dump of all results
+    python run_dataset.py --queue         # list AI-dependent work awaiting retry
+    python run_dataset.py --retry         # retry queued AI-dependent work now
 """
 from __future__ import annotations
 
@@ -18,8 +20,9 @@ import io
 import json
 import sys
 
-from app import ingest
+from app import ai_queue, ingest
 from app.graph import build_graph
+from app.models import RawEnquiry
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -50,6 +53,57 @@ def run_all(quiet: bool = False) -> list[dict]:
     return results
 
 
+def print_queue() -> None:
+    items = ai_queue.list_all()
+    if not items:
+        print("ai_queue is empty.")
+        return
+    header = f"{'id':<4}{'source':<8}{'status':<9}{'attempts':<9}{'updated_at':<28}last_error"
+    print(header)
+    print("-" * len(header))
+    for item in items:
+        err = (item["last_error"] or "")[:60]
+        print(
+            f"{item['id']:<4}{item['source_email_id'] or item['enquiry_id']:<8}"
+            f"{item['status']:<9}{item['attempts']:<9}{item['updated_at']:<28}{err}"
+        )
+
+
+def retry_queue() -> list[dict]:
+    """Retries every currently-queued item. Idempotent: an item already
+    marked 'done' is never re-processed (list_queued only returns 'queued'
+    rows), so re-running --retry after a successful drain is a no-op."""
+    workflow = build_graph()
+    crm_records = ingest.load_crm_records()
+    staff = ingest.load_staff_directory()
+
+    results = []
+    queued = ai_queue.list_queued()
+    if not queued:
+        print("Nothing queued to retry.")
+        return results
+
+    for item in queued:
+        raw = RawEnquiry.model_validate_json(item["payload"])
+        state = workflow.invoke(
+            {
+                "raw": raw,
+                "crm_reference": crm_records,
+                "staff_directory": staff,
+                "source_email_id": item["source_email_id"],
+                "retry_of_queue_id": item["id"],
+            }
+        )
+        label = item["source_email_id"] or item["enquiry_id"]
+        if state.get("error"):
+            print(f"Retry {label}: still unavailable ({state['error']})")
+        else:
+            ai_queue.mark_done(item["id"])
+            print(f"Retry {label}: succeeded (route={state.get('route')})")
+        results.append(state)
+    return results
+
+
 def _fmt_match(state: dict) -> str:
     match = state.get("match_result")
     if not match or not match.candidates:
@@ -68,6 +122,7 @@ def _fmt_owner(state: dict) -> str:
 def print_table(results: list[dict]) -> None:
     columns = [
         ("ID", 6),
+        ("AI", 5),
         ("Category", 16),
         ("Conf.", 7),
         ("Route", 16),
@@ -82,8 +137,10 @@ def print_table(results: list[dict]) -> None:
     for state in results:
         triage = state.get("triage")
         approval = state.get("approval")
+        ai_status = state.get("ai_status", "available")
         row = [
             state.get("source_email_id", "?"),
+            "ok" if ai_status == "available" else "DOWN",
             triage.category.value if triage else "-",
             f"{triage.confidence:.2f}" if triage else "-",
             state.get("route", "-"),
@@ -113,7 +170,10 @@ def _print_one_detail(state: dict) -> None:
     approval = state.get("approval")
 
     print(f"\n{'=' * 70}\n{state.get('source_email_id')} - {enquiry.sender_email or enquiry.sender_name}\n{'=' * 70}")
+    print(f"AI status     : {state.get('ai_status', 'available')}")
     print(f"Route         : {state.get('route')}")
+    if state.get("route") == "queued":
+        print(f"Queued        : queue_id={state.get('queue_id')} — AI unavailable, awaiting retry")
     if triage:
         print(f"Category      : {triage.category.value} (confidence={triage.confidence:.2f})")
         print(f"Reasoning     : {triage.reasoning}")
@@ -153,6 +213,9 @@ def _dump_json(results: list[dict]) -> str:
             {
                 "id": state.get("source_email_id"),
                 "route": state.get("route"),
+                "ai_status": state.get("ai_status", "available"),
+                "queue_id": state.get("queue_id"),
+                "retry_of_queue_id": state.get("retry_of_queue_id"),
                 "triage": state["triage"].model_dump() if state.get("triage") else None,
                 "validation": state["validation"].model_dump() if state.get("validation") else None,
                 "match_result": state["match_result"].model_dump() if state.get("match_result") else None,
@@ -170,7 +233,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Test 2 dataset through the enquiry triage workflow.")
     parser.add_argument("--id", help="Show full detail for one enquiry id (e.g. E005)")
     parser.add_argument("--json", action="store_true", help="Dump raw results as JSON instead of a table")
+    parser.add_argument("--queue", action="store_true", help="List AI-dependent work awaiting retry")
+    parser.add_argument("--retry", action="store_true", help="Retry queued AI-dependent work now")
     args = parser.parse_args()
+
+    if args.queue:
+        print_queue()
+        return
+    if args.retry:
+        retry_queue()
+        print()
+        print_queue()
+        return
 
     results = run_all(quiet=args.json)
 

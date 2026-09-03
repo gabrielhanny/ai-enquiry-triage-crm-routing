@@ -2,10 +2,22 @@
 
     Normalize -> Triage (LLM) -> Validate (deterministic) -> recommend_owner
         -> archive                                   [junk]
-        -> clarify -> human_approval -> apply_crm_action  [incomplete / low confidence / LLM failure]
+        -> clarify -> human_approval -> apply_crm_action  [incomplete / low confidence, LLM responded]
+        -> queue_for_retry                            [LLM/API unavailable — see below]
         -> analyze_crm -> draft_response -> human_approval -> apply_crm_action
                [sales / support / technical / operations / infrastructure / other]
     -> audit (always, exactly once per enquiry)
+
+If the LLM call itself fails (outage, timeout, etc.), triage_node never
+fabricates a TriageResult. validate_node routes that case to `queued`,
+distinct from `clarify` (which is for a TriageResult the LLM *did* produce,
+just incomplete or low-confidence). queue_for_retry_node records the raw
+enquiry in the ai_queue SQLite table (app/ai_queue.py) and goes straight to
+audit — no draft, no approval, no CRM action is attempted while AI-dependent
+understanding is unavailable. A later retry (run_dataset.py --retry)
+re-invokes this same graph with the queued RawEnquiry; if the LLM has come
+back, it proceeds through the normal path including human_approval before
+any CRM mutation, exactly like a fresh enquiry.
 
 analyze_crm is READ-ONLY: it matches the enquiry against a pool of candidate
 CRM records (pre-existing rows loaded from crm.csv, plus records already
@@ -26,6 +38,7 @@ from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from . import ai_queue
 from . import approval as approval_mod
 from . import audit
 from . import crm as crm_mod
@@ -67,6 +80,9 @@ class EnquiryState(TypedDict, total=False):
     draft: str
     approval: ApprovalRecord
     error: Optional[str]
+    ai_status: str  # "available" | "unavailable"
+    queue_id: Optional[int]  # set when this invocation newly queues the enquiry
+    retry_of_queue_id: Optional[int]  # set by the caller when re-invoking a queued item
 
 
 def normalize_node(state: EnquiryState) -> dict:
@@ -85,16 +101,19 @@ def normalize_node(state: EnquiryState) -> dict:
 
 def triage_node(state: EnquiryState) -> dict:
     try:
-        return {"triage": llm.triage_enquiry(state["enquiry"])}
+        return {"triage": llm.triage_enquiry(state["enquiry"]), "ai_status": "available"}
     except Exception as exc:  # noqa: BLE001 - failure path is intentional
-        return {"error": str(exc)}
+        return {"error": str(exc), "ai_status": "unavailable"}
 
 
 def validate_node(state: EnquiryState) -> dict:
     if state.get("error"):
-        # LLM failed entirely: fail safe by routing to a human via clarification
-        # rather than guessing a category or dropping the enquiry.
-        return {"route": "clarify"}
+        # The LLM call itself failed (outage, timeout, etc.) — no TriageResult
+        # exists to validate. This is distinct from "clarify": there, the LLM
+        # responded but the enquiry was incomplete/low-confidence. Here, AI
+        # understanding is simply unavailable, so the enquiry is queued for
+        # retry rather than fabricated or treated as an ordinary clarification.
+        return {"route": "queued"}
     # Deterministic category safeguard (e.g. a customer's own contact-detail
     # correction must never be routed as `infrastructure`) runs before
     # validation/routing so every downstream consumer — owner recommendation,
@@ -121,6 +140,21 @@ def recommend_owner_node(state: EnquiryState) -> dict:
 
 def archive_node(state: EnquiryState) -> dict:
     return {}
+
+
+def queue_for_retry_node(state: EnquiryState) -> dict:
+    """AI-dependent work (classification, extraction, drafting) could not
+    be completed because the LLM was unavailable. Records the raw enquiry
+    in the ai_queue SQLite table for later retry — never fabricates a
+    TriageResult, and performs no draft, approval, or CRM action here."""
+    enquiry = state["enquiry"]
+    queue_id = ai_queue.enqueue(
+        enquiry_id=enquiry.enquiry_id,
+        source_email_id=state.get("source_email_id"),
+        raw=state["raw"],
+        error=state.get("error"),
+    )
+    return {"queue_id": queue_id}
 
 
 def clarify_node(state: EnquiryState) -> dict:
@@ -262,6 +296,10 @@ def audit_node(state: EnquiryState) -> dict:
         details={
             "source_email_id": state.get("source_email_id"),
             "error": state.get("error"),
+            "ai_status": state.get("ai_status", "available"),
+            "degraded_mode": state.get("route") == "queued",
+            "queue_id": state.get("queue_id"),
+            "retry_of_queue_id": state.get("retry_of_queue_id"),
             "reasoning": triage.reasoning if triage else None,
             "missing_fields": validation.missing_fields if validation else None,
             "draft": state.get("draft"),
@@ -285,6 +323,7 @@ def build_graph():
     graph.add_node("recommend_owner", recommend_owner_node)
     graph.add_node("archive", archive_node)
     graph.add_node("clarify", clarify_node)
+    graph.add_node("queue_for_retry", queue_for_retry_node)
     graph.add_node("analyze_crm", analyze_crm_node)
     graph.add_node("draft_response", draft_response_node)
     graph.add_node("human_approval", human_approval_node)
@@ -301,6 +340,7 @@ def build_graph():
         {
             "archive": "archive",
             "clarify": "clarify",
+            "queued": "queue_for_retry",
             "sales": "analyze_crm",
             "support": "analyze_crm",
             "technical": "analyze_crm",
@@ -311,6 +351,7 @@ def build_graph():
     )
     graph.add_edge("archive", "audit")
     graph.add_edge("clarify", "human_approval")
+    graph.add_edge("queue_for_retry", "audit")
     graph.add_edge("analyze_crm", "draft_response")
     graph.add_edge("draft_response", "human_approval")
     # apply_crm_action is shared by both approval-gated paths; it no-ops

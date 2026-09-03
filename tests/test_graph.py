@@ -67,19 +67,27 @@ def test_junk_enquiry_routes_to_archive(monkeypatch):
     assert "approval" not in result
 
 
-def test_llm_failure_fails_safe_to_clarify(monkeypatch):
+def test_llm_failure_queues_for_retry_instead_of_fabricating_triage(monkeypatch):
+    """An LLM outage must never produce a fake TriageResult, and must be
+    distinguished from an ordinary (data-completeness) clarification."""
+
     def boom(enquiry):
         raise RuntimeError("LLM unavailable")
 
     monkeypatch.setattr(llm, "triage_enquiry", boom)
-    monkeypatch.setattr(llm, "draft_clarification", lambda enquiry, missing: "please clarify (fallback)")
 
     workflow = build_graph()
     result = workflow.invoke({"raw": make_raw()})
 
-    assert result["route"] == "clarify"
+    assert result["route"] == "queued"
+    assert result["ai_status"] == "unavailable"
     assert result["error"] == "LLM unavailable"
-    assert result["approval"].approved is True
+    assert "triage" not in result
+    # No draft, no approval, no CRM action while AI understanding is unavailable.
+    assert "draft" not in result
+    assert "approval" not in result
+    assert "crm_action" not in result
+    assert isinstance(result["queue_id"], int)
 
 
 def test_repeat_sales_enquiry_is_flagged_duplicate_in_graph(monkeypatch):
@@ -485,3 +493,132 @@ def test_contact_correction_is_not_routed_to_infrastructure_even_if_llm_mislabel
     assert result["route"] == "operations"
     assert result["triage"].category == EnquiryCategory.OPERATIONS
     assert result["owner"].owner == "Ties Rahardjo"
+
+
+# --- Degraded mode: LLM outage must queue, never fabricate, never mutate CRM ---
+
+
+def test_degraded_mode_never_creates_a_crm_record(monkeypatch):
+    from app import ai_queue, crm as crm_mod
+
+    monkeypatch.setattr(llm, "triage_enquiry", lambda enquiry: (_ for _ in ()).throw(RuntimeError("outage")))
+
+    workflow = build_graph()
+    result = workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+
+    assert result["route"] == "queued"
+    assert crm_mod.crm.all_records() == []
+    queued = ai_queue.list_queued()
+    assert len(queued) == 1
+    assert queued[0]["source_email_id"] == "E999"
+    assert queued[0]["status"] == "queued"
+
+
+def test_degraded_mode_is_visible_in_audit_trail(monkeypatch):
+    from app.audit import fetch_all_events
+    import json as json_mod
+
+    monkeypatch.setattr(llm, "triage_enquiry", lambda enquiry: (_ for _ in ()).throw(RuntimeError("outage")))
+
+    workflow = build_graph()
+    workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+
+    events = fetch_all_events()
+    assert len(events) == 1
+    details = json_mod.loads(events[0]["details"])
+    assert details["ai_status"] == "unavailable"
+    assert details["degraded_mode"] is True
+    assert details["error"] == "outage"
+    assert isinstance(details["queue_id"], int)
+
+
+def test_enqueue_is_idempotent_for_the_same_source_email(monkeypatch):
+    """Re-attempting the same enquiry while the LLM is still down must not
+    pile up duplicate queue rows."""
+    from app import ai_queue
+
+    monkeypatch.setattr(llm, "triage_enquiry", lambda enquiry: (_ for _ in ()).throw(RuntimeError("outage")))
+
+    workflow = build_graph()
+    workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+    workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+
+    queued = ai_queue.list_queued()
+    assert len(queued) == 1
+    assert queued[0]["attempts"] == 2
+
+
+def test_retry_after_llm_recovers_completes_workflow_with_approval(monkeypatch):
+    """Once the LLM is back, retrying the queued item proceeds through the
+    normal path — including human approval — before any CRM mutation."""
+    from app import ai_queue, crm as crm_mod
+    from app.models import RawEnquiry
+
+    monkeypatch.setattr(llm, "triage_enquiry", lambda enquiry: (_ for _ in ()).throw(RuntimeError("outage")))
+    workflow = build_graph()
+    workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+
+    queued = ai_queue.list_queued()
+    assert len(queued) == 1
+    item = queued[0]
+
+    # LLM is back online.
+    monkeypatch.setattr(
+        llm,
+        "triage_enquiry",
+        lambda enquiry: TriageResult(
+            category=EnquiryCategory.SALES, confidence=0.9, product_interest="solar", reasoning="recovered"
+        ),
+    )
+    monkeypatch.setattr(llm, "draft_response", lambda enquiry, triage, crm_action: "draft response")
+
+    raw = RawEnquiry.model_validate_json(item["payload"])
+    result = workflow.invoke(
+        {"raw": raw, "source_email_id": item["source_email_id"], "retry_of_queue_id": item["id"]}
+    )
+
+    assert result["ai_status"] == "available"
+    assert result["route"] == "sales"
+    assert result["approval"].approved is True
+    assert result["crm_action"].action == "create_lead"
+    assert len(crm_mod.crm.all_records()) == 1
+
+    ai_queue.mark_done(item["id"])
+    assert ai_queue.list_queued() == []
+
+
+def test_retry_cannot_duplicate_crm_action_once_marked_done(monkeypatch):
+    """A queue item marked 'done' must never be reprocessed by a later
+    retry sweep, so a successful retry can't create a second CRM record."""
+    from app import ai_queue, crm as crm_mod
+    from app.models import RawEnquiry
+
+    monkeypatch.setattr(llm, "triage_enquiry", lambda enquiry: (_ for _ in ()).throw(RuntimeError("outage")))
+    workflow = build_graph()
+    workflow.invoke({"raw": make_raw(), "source_email_id": "E999"})
+    item = ai_queue.list_queued()[0]
+
+    monkeypatch.setattr(
+        llm,
+        "triage_enquiry",
+        lambda enquiry: TriageResult(
+            category=EnquiryCategory.SALES, confidence=0.9, product_interest="solar", reasoning="recovered"
+        ),
+    )
+    monkeypatch.setattr(llm, "draft_response", lambda enquiry, triage, crm_action: "draft response")
+
+    # First retry sweep: succeeds and marks done.
+    raw = RawEnquiry.model_validate_json(item["payload"])
+    workflow.invoke({"raw": raw, "source_email_id": item["source_email_id"], "retry_of_queue_id": item["id"]})
+    ai_queue.mark_done(item["id"])
+
+    assert len(crm_mod.crm.all_records()) == 1
+    assert ai_queue.list_queued() == []  # nothing left for a second sweep to pick up
+
+    # Enqueuing the same source email again (e.g. a stray re-submission)
+    # must not resurrect the completed item into 'queued'.
+    ai_queue.enqueue(enquiry_id="whatever", source_email_id="E999", raw=raw, error="stray failure")
+    all_items = ai_queue.list_all()
+    assert len(all_items) == 1
+    assert all_items[0]["status"] == "done"
+    assert ai_queue.list_queued() == []
